@@ -15,6 +15,12 @@ Frequently, I can see some anomoly just by skimming with Wireshark, and I want
 to know if that anomoly happens frequently, on which transport sessions,
 etc.
 
+THESE TOOLS ARE EXAMPLE CODE, NOT INTENDED TO BE END USER TOOLS!
+They might evolve on a day-to-day basis if I am working with a packet capture.
+The proper use of these tools is to select one that comes reasonably close
+to what you want, then make it a separate tool and evolve it to what you
+want.
+
 My general procedure is to first export the packet capture as a text file
 with full dissections but without the summary lines.
 Then I write perl code to scan the text file.
