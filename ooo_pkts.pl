@@ -8,7 +8,7 @@
 # waived all copyright and related or neighboring rights to this work.
 # In other words, you can use this code for any purpose without any
 # restrictions.  This work is published from: United States.  The project home
-# is https://github.com/UltraMessaging/ooo_pkts.pl
+# is https://github.com/UltraMessaging/pkt_analysis
 
 use strict;
 use warnings;
@@ -20,8 +20,8 @@ use Carp;
 my $tool = basename($0);
 
 # process options.
-use vars qw($opt_h $opt_o);
-getopts('ho:') || mycroak("getopts failure");
+use vars qw($opt_h $opt_o $opt_v);
+getopts('ho:v') || mycroak("getopts failure");
 
 if (defined($opt_h)) {
   help();
@@ -57,10 +57,14 @@ my %high_trailing;
 my %unrec;
 my %dest_addrs;
 my %dest_ports;
-my %topic_ids;  # session_id,topic_index
+my %topic_id_low_sqns;  # session_id,topic_index
+my %topic_id_high_sqns;  # session_id,topic_index
+my %topic_id_pkts;
 
 my $min_win_size = 999999999999;
 my $max_win_size = 0;
+my $max_trailing_dist = -1;
+my $max_trailing_dist_info;
 
 # Main loop; read each line in each file.
 while (<>) {
@@ -140,8 +144,13 @@ sub process_frame {
     $frame = $1;
     return;
   }
-  #                 '    Destination Address: 239.192.69.22'
+  #                 '    Destination Address: 239.192.69.22' (newer text)
   elsif ($iline =~ /^    Destination Address: (\d+\.\d+\.\d+\.\d+)\b/) {
+    $dest_addr = $1;
+    return;
+  }
+  #                 '    Destination: 239.192.69.22' (older text)
+  elsif ($iline =~ /^    Destination: (\d+\.\d+\.\d+\.\d+)\b/) {
     $dest_addr = $1;
     return;
   }
@@ -202,7 +211,23 @@ sub process_pkt {
 
   $dest_ports{$dest_port} = 1;
   $dest_addrs{$dest_addr} = 1;
-  $topic_ids{"$session_id,$topic_index"} = 1;
+  if (defined($topic_id_low_sqns{"SID=$session_id,TIDX=$topic_index"})) {
+    if ($topic_sqn < $topic_id_low_sqns{"SID=$session_id,TIDX=$topic_index"}) {
+      $topic_id_low_sqns{"SID=$session_id,TIDX=$topic_index"} = $topic_sqn;
+    }
+  } else { $topic_id_low_sqns{"SID=$session_id,TIDX=$topic_index"} = $topic_sqn; }
+
+  if (defined($topic_id_high_sqns{"SID=$session_id,TIDX=$topic_index"})) {
+    if ($topic_sqn > $topic_id_high_sqns{"SID=$session_id,TIDX=$topic_index"}) {
+      $topic_id_high_sqns{"SID=$session_id,TIDX=$topic_index"} = $topic_sqn;
+    }
+  } else { $topic_id_high_sqns{"SID=$session_id,TIDX=$topic_index"} = $topic_sqn; }
+
+  if (defined($topic_id_pkts{"SID=$session_id,TIDX=$topic_index,SQN=$topic_sqn"})) {
+    print $out_fd "Duplicate topic sqn, frame $frame\n";
+  } else {
+    $topic_id_pkts{"SID=$session_id,TIDX=$topic_index,SQN=$topic_sqn"} = "F=$frame,TSQN=$transp_sqn";
+  }
 
   if (defined($prev_epoc_usec)) {
     if ($epoch_usec < $prev_epoc_usec) {
@@ -244,8 +269,7 @@ sub process_pkt {
 
   if (defined($pkts{"SID=$session_id,TSQN=$transp_sqn"})) {
     print $out_fd "Duplicate sqn, frame $frame\n";
-  }
-  else {
+  } else {
     $pkts{"SID=$session_id,TSQN=$transp_sqn"} = "F=$frame,TI=$topic_index,SQN=$topic_sqn";
     $pkt_times{"SID=$session_id,TSQN=$transp_sqn"} = $epoch_usec;
   }
@@ -257,8 +281,14 @@ sub process_pkt {
         $gap_low = $i;
       }
       if ($i < $high_trailing{$session_id}) {
-        $unrec{"SID=$session_id,TSQN=$i"} = -1;
-        print $out_fd "gap sqn ($i) < high_trailing{$session_id} ($high_trailing{$session_id}), frame=$frame\n";
+        if (! defined($unrec{"SID=$session_id,TSQN=$i"})) {  # only print once (first time).
+          print $out_fd "gap sqn ($i) < high_trailing{$session_id} ($high_trailing{$session_id}), frame=$frame\n";
+          $unrec{"SID=$session_id,TSQN=$i"} = -1;
+        }
+        if (($high_trailing{$session_id} - $i) > $max_trailing_dist) {
+          $max_trailing_dist = $high_trailing{$session_id} - $i;
+          $max_trailing_dist_info = "F=$frame,TSQN=$i,TRAIL=$high_trailing{$session_id}";
+        }
       }
     }
   }
@@ -269,6 +299,7 @@ sub process_pkt {
   #}
 
   if (defined($unrec{"SID=$session_id,TSQN=$transp_sqn"})) {
+    assrt($unrec{"SID=$session_id,TSQN=$transp_sqn"} == -1);
     $unrec{"SID=$session_id,TSQN=$transp_sqn"} = "F=$frame,TI=$topic_index,SQN=$topic_sqn";
   }
 }  # process_pkt
@@ -292,7 +323,8 @@ sub final {
     }
   }
 
-  print $out_fd "max_win_size=$max_win_size, min_win_size=$min_win_size, num_transport_sessions=$num_transport_sessions\n";
+  print $out_fd "max_win_size=$max_win_size, min_win_size=$min_win_size, max_trailing_dist=$max_trailing_dist (info=$max_trailing_dist_info)\n";
+  print $out_fd "num_transport_sessions=$num_transport_sessions\n";
 
   my $cnt;
 
@@ -322,22 +354,41 @@ sub final {
 
   print $out_fd "Topic IDs: ";
   $cnt = 0;
-  foreach my $topic (keys(%topic_ids)) {
+  foreach my $topic (keys(%topic_id_low_sqns)) {
     $cnt++;
     print $out_fd "$topic ";
   }
   print $out_fd "(cnt=$cnt)\n";
 
-  print $out_fd "Remaining gap counts:\n";
+  print $out_fd "Remaining gap counts\n";
   foreach my $session_id (keys(%low_sqns)) {
     my $num_gaps = 0;
     for (my $i = $low_sqns{$session_id}; $i < $high_sqns{$session_id}; $i++) {
       if (! defined($pkts{"SID=$session_id,TSQN=$i"})) {
         $num_gaps++;
+        if ($opt_v) {
+          print $out_fd "Missing pkt: SID=$session_id,TSQN=$i\n";
+        }
       }
     }
     if ($num_gaps > 0) {
       print $out_fd "Session $session_id, num_gaps=$num_gaps\n";
+    }
+  }
+
+  print $out_fd "Find topic-level gaps\n";
+  foreach my $topic_id (keys(%topic_id_low_sqns)) {
+    my $num_gaps = 0;
+    for (my $i = $topic_id_low_sqns{$topic_id}; $i < $topic_id_high_sqns{$topic_id}; $i++) {
+      if (! defined($topic_id_pkts{"$topic_id,SQN=$i"})) {
+        $num_gaps++;
+        if ($opt_v) {
+          print $out_fd "Missing topic pkt: $topic_id,SQN=$i\n";
+        }
+      }
+    }
+    if ($num_gaps > 0) {
+      print $out_fd "Topic $topic_id, num_gaps=$num_gaps\n";
     }
   }
 }  # final
@@ -379,6 +430,7 @@ Usage: $tool [-h] [-o out_file] [file ...]
 Where ('R' indicates required option):
     -h - help
     -o out_file - output file (default: STDOUT).
+    -v - verbose.
     file ... - zero or more input files.  If omitted, inputs from stdin.
 
 __EOF__
